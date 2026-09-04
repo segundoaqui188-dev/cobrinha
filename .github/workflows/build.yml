@@ -1,1 +1,113 @@
+name: Build Android APK
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android SDK, NDK and CMake
+        shell: bash
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager "platform-tools" "platforms;android-35" "build-tools;35.0.0" "ndk;27.2.12479018" "cmake;3.22.1"
+
+      - name: Configure CMake
+        shell: bash
+        env:
+          ANDROID_NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/27.2.12479018
+        run: |
+          cmake -S . -B build/android \
+            -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_PLATFORM=android-29 \
+            -DANDROID_STL=c++_static
+
+      - name: Build native library
+        run: |
+          cmake --build build/android --config Release --parallel 2
+
+      - name: Prepare APK staging directory
+        shell: bash
+        run: |
+          rm -rf apk
+          mkdir -p apk/lib/arm64-v8a
+          mkdir -p apk/META-INF
+          cp AndroidManifest.xml apk/AndroidManifest.xml
+          cp build/android/apk-lib/arm64-v8a/libmain.so apk/lib/arm64-v8a/libmain.so
+
+      - name: Create unsigned APK with aapt2
+        shell: bash
+        env:
+          BUILD_TOOLS: ${{ env.ANDROID_HOME }}/build-tools/35.0.0
+          SDK_PLATFORM: ${{ env.ANDROID_HOME }}/platforms/android-35/android.jar
+        run: |
+          "$BUILD_TOOLS/aapt2" link \
+            --proto-format \
+            -o base.apk \
+            -I "$SDK_PLATFORM" \
+            --manifest AndroidManifest.xml
+
+          rm -rf apk-stage
+          mkdir -p apk-stage/lib/arm64-v8a
+          unzip -q base.apk -d apk-stage
+          cp build/android/apk-lib/arm64-v8a/libmain.so apk-stage/lib/arm64-v8a/libmain.so
+          (cd apk-stage && zip -qr ../unsigned.apk .)
+          rm -f base.apk
+
+      - name: Create debug keystore
+        shell: bash
+        run: |
+          keytool -genkeypair \
+            -keystore debug.keystore \
+            -storepass android \
+            -alias androiddebugkey \
+            -keypass android \
+            -dname "CN=Android Debug,O=Android,C=US" \
+            -keyalg RSA \
+            -keysize 2048 \
+            -validity 10000
+
+      - name: Align and sign APK
+        shell: bash
+        env:
+          BUILD_TOOLS: ${{ env.ANDROID_HOME }}/build-tools/35.0.0
+        run: |
+          "$BUILD_TOOLS/zipalign" -f 4 unsigned.apk aligned.apk
+          "$BUILD_TOOLS/apksigner" sign \
+            --ks debug.keystore \
+            --ks-pass pass:android \
+            --key-pass pass:android \
+            --ks-key-alias androiddebugkey \
+            --out Snake-Raylib-Android.apk \
+            aligned.apk
+          "$BUILD_TOOLS/apksigner" verify --verbose Snake-Raylib-Android.apk
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Snake-Raylib-Android-arm64-v8a
+          path: Snake-Raylib-Android.apk
+          if-no-files-found: error
+          retention-days: 14
 
