@@ -1,31 +1,30 @@
 name: Android Build
 
 on:
-  workflow_dispatch:
   push:
     branches:
       - main
       - master
+  workflow_dispatch:
+
+permissions:
+  contents: read
 
 jobs:
   android-build:
     name: Build Snake Android APK
     runs-on: ubuntu-24.04
 
-    permissions:
-      contents: read
-
     env:
       ANDROID_API: "29"
       ANDROID_NDK_VERSION: "27.2.12479018"
       CMAKE_VERSION: "3.31.6"
-      RAYLIB_VERSION: "6.0"
 
     steps:
-      - name: Checkout repository
+      - name: Checkout
         uses: actions/checkout@v5
 
-      - name: Setup Java
+      - name: Setup Java 17
         uses: actions/setup-java@v5
         with:
           distribution: temurin
@@ -34,123 +33,150 @@ jobs:
       - name: Setup Android SDK
         uses: android-actions/setup-android@v4
 
-      - name: Install Android SDK packages
+      - name: Install Android SDK, NDK and CMake
+        shell: bash
         run: |
-          sdkmanager --licenses <<< "y" || true
-          sdkmanager \
+          yes | sdkmanager --licenses >/dev/null 2>&1 || true
+
+          sdkmanager --install \
             "platform-tools" \
             "platforms;android-${ANDROID_API}" \
             "build-tools;35.0.0" \
-            "cmake;${CMAKE_VERSION}" \
-            "ndk;${ANDROID_NDK_VERSION}"
+            "ndk;${ANDROID_NDK_VERSION}" \
+            "cmake;${CMAKE_VERSION}"
 
-      - name: Configure Android environment
-        run: |
-          echo "ANDROID_HOME=${ANDROID_SDK_ROOT}" >> "$GITHUB_ENV"
           echo "ANDROID_NDK_HOME=${ANDROID_SDK_ROOT}/ndk/${ANDROID_NDK_VERSION}" >> "$GITHUB_ENV"
-          echo "${ANDROID_SDK_ROOT}/platform-tools" >> "$GITHUB_PATH"
-          echo "${ANDROID_SDK_ROOT}/cmdline-tools/latest/bin" >> "$GITHUB_PATH"
+          echo "CMAKE_BIN=${ANDROID_SDK_ROOT}/cmake/${CMAKE_VERSION}/bin" >> "$GITHUB_ENV"
 
-      - name: Download Raylib source
+      - name: Verify Android toolchain
+        shell: bash
         run: |
-          curl -L \
-            "https://github.com/raysan5/raylib/archive/refs/tags/${RAYLIB_VERSION}.tar.gz" \
-            -o raylib.tar.gz
+          echo "SDK: ${ANDROID_SDK_ROOT}"
+          echo "NDK: ${ANDROID_NDK_HOME}"
+          echo "CMake: ${CMAKE_BIN}"
 
-          tar -xzf raylib.tar.gz
+          test -f "${ANDROID_NDK_HOME}/build/cmake/android.toolchain.cmake"
+          test -x "${CMAKE_BIN}/cmake"
+          test -x "${CMAKE_BIN}/ninja"
 
-          mv "raylib-${RAYLIB_VERSION}" raylib
+          "${CMAKE_BIN}/cmake" --version
+          "${CMAKE_BIN}/ninja" --version
 
-          test -f raylib/CMakeLists.txt
-
-      - name: Configure Raylib for Android
+      - name: Configure project
+        shell: bash
         run: |
-          cmake \
-            -S raylib \
-            -B raylib/build-android \
-            -DCMAKE_SYSTEM_NAME=Android \
-            -DCMAKE_ANDROID_NDK="${ANDROID_NDK_HOME}" \
-            -DCMAKE_ANDROID_ARCH_ABI=arm64-v8a \
-            -DCMAKE_ANDROID_API=${ANDROID_API} \
+          rm -rf build
+
+          "${CMAKE_BIN}/cmake" \
+            -S . \
+            -B build \
+            -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
-            -DBUILD_SHARED_LIBS=OFF \
+            -DCMAKE_TOOLCHAIN_FILE="${ANDROID_NDK_HOME}/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_PLATFORM=android-${ANDROID_API} \
+            -DANDROID_STL=c++_static \
+            -DPLATFORM=Android \
+            -DOPENGL_VERSION="ES 2.0" \
             -DBUILD_EXAMPLES=OFF \
             -DBUILD_GAMES=OFF \
-            -DCMAKE_TOOLCHAIN_FILE="${ANDROID_NDK_HOME}/build/cmake/android.toolchain.cmake"
+            -DBUILD_SHARED_LIBS=OFF \
+            -DCMAKE_MAKE_PROGRAM="${CMAKE_BIN}/ninja"
 
-      - name: Build Raylib
+      - name: Build game
+        shell: bash
         run: |
-          cmake \
-            --build raylib/build-android \
+          "${CMAKE_BIN}/cmake" \
+            --build build \
             --config Release \
             --parallel 2
 
-      - name: Prepare Android project
+          echo "===== Build outputs ====="
+          find build -type f \
+            \( -name "*.so" -o -name "*.a" \) \
+            -print
+
+          test -f build/apk-lib/arm64-v8a/libmain.so
+
+      - name: Prepare APK
+        shell: bash
         run: |
-          rm -rf android-build
+          rm -rf apk-stage base-extract
 
-          mkdir -p android-build/app/src/main/cpp
-          mkdir -p android-build/app/src/main
+          mkdir -p apk-stage/lib/arm64-v8a
 
-          cp main.c android-build/app/src/main/cpp/main.c
-          cp CMakeLists.txt android-build/app/src/main/cpp/CMakeLists.txt
-          cp AndroidManifest.xml android-build/app/src/main/AndroidManifest.xml
+          cp AndroidManifest.xml \
+            apk-stage/AndroidManifest.xml
 
-          cp -R raylib android-build/app/src/main/cpp/raylib
+          cp build/apk-lib/arm64-v8a/libmain.so \
+            apk-stage/lib/arm64-v8a/libmain.so
 
-      - name: Show project files
+      - name: Package unsigned APK
+        shell: bash
         run: |
-          echo "===== PROJECT ====="
-          find android-build -maxdepth 5 -type f | sort
-          echo "==================="
+          BUILD_TOOLS="${ANDROID_SDK_ROOT}/build-tools/35.0.0"
+          ANDROID_JAR="${ANDROID_SDK_ROOT}/platforms/android-${ANDROID_API}/android.jar"
 
-      - name: Configure game
-        working-directory: android-build
+          "$BUILD_TOOLS/aapt2" link \
+            --proto-format \
+            -o base-res.apk \
+            -I "$ANDROID_JAR" \
+            --manifest AndroidManifest.xml
+
+          mkdir -p base-extract
+
+          unzip -q base-res.apk -d base-extract
+
+          cp -R apk-stage/lib base-extract/
+
+          (
+            cd base-extract
+            zip -qr ../unsigned.apk .
+          )
+
+          test -f unsigned.apk
+
+      - name: Create debug keystore
+        shell: bash
         run: |
-          cmake \
-            -S app/src/main/cpp \
-            -B build \
-            -DCMAKE_SYSTEM_NAME=Android \
-            -DCMAKE_ANDROID_NDK="${ANDROID_NDK_HOME}" \
-            -DCMAKE_ANDROID_ARCH_ABI=arm64-v8a \
-            -DCMAKE_ANDROID_API=${ANDROID_API} \
-            -DCMAKE_BUILD_TYPE=Release \
-            -DCMAKE_TOOLCHAIN_FILE="${ANDROID_NDK_HOME}/build/cmake/android.toolchain.cmake" \
-            -DCMAKE_MAKE_PROGRAM="${ANDROID_SDK_ROOT}/cmake/${CMAKE_VERSION}/bin/ninja"
+          keytool -genkeypair \
+            -keystore debug.keystore \
+            -storepass android \
+            -keypass android \
+            -alias androiddebugkey \
+            -dname "CN=Android Debug,O=Android,C=US" \
+            -keyalg RSA \
+            -keysize 2048 \
+            -validity 10000
 
-      - name: Build native game
-        working-directory: android-build
+      - name: Align and sign APK
+        shell: bash
         run: |
-          cmake --build build --config Release --parallel 2
+          BUILD_TOOLS="${ANDROID_SDK_ROOT}/build-tools/35.0.0"
 
-      - name: Build APK
-        working-directory: android-build
-        run: |
-          mkdir -p apk
+          "$BUILD_TOOLS/zipalign" \
+            -f 4 \
+            unsigned.apk \
+            aligned.apk
 
-          if [ -f "build/Snake-Raylib-Android.apk" ]; then
-            cp "build/Snake-Raylib-Android.apk" "apk/Snake-Raylib-Android.apk"
-          else
-            echo "APK não encontrado pelo CMake."
-            find build -type f | sort
-            exit 1
-          fi
+          "$BUILD_TOOLS/apksigner" sign \
+            --ks debug.keystore \
+            --ks-pass pass:android \
+            --key-pass pass:android \
+            --ks-key-alias androiddebugkey \
+            --out Snake-Raylib-Android.apk \
+            aligned.apk
 
-      - name: Verify APK
-        working-directory: android-build
-        run: |
-          test -f apk/Snake-Raylib-Android.apk
+          "$BUILD_TOOLS/apksigner" verify \
+            --verbose \
+            Snake-Raylib-Android.apk
 
-          echo "APK encontrado:"
-          ls -lh apk/Snake-Raylib-Android.apk
+          ls -lh Snake-Raylib-Android.apk
 
-          "${ANDROID_SDK_ROOT}/build-tools/35.0.0/apksigner" verify \
-            apk/Snake-Raylib-Android.apk || true
-
-      - name: Upload APK artifact
+      - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
           name: Snake-Raylib-Android-arm64-v8a
-          path: android-build/apk/Snake-Raylib-Android.apk
+          path: Snake-Raylib-Android.apk
           if-no-files-found: error
           retention-days: 30
